@@ -1,0 +1,435 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+###############################################
+# CK+ Training — MobileNetV3-Small + ViT (Attention) with PRETRAINED weights
+# - Uses ImageNet pretrained weights for BOTH backbones
+# - Dataset: CK+ (7 classes) in class-subfolder format
+# - Prints Acc/Prec/Rec/F1/mAP; saves plots & confusion matrix
+###############################################
+
+!pip -q install timm==1.0.9
+
+###############################################
+# CK+ — <2M Params, PRETRAINED Backbone
+# ShuffleNetV2 0.5× (ImageNet pretrained) + Tiny ViT‑Style Attention Head
+# - Dataset: CK+ (7 classes) in class-subfolder format
+# - Saves: best weights, history CSV/JSON, plots, confusion matrix, summary
+# - Prints: Acc, Precision, Recall, F1, mAP, and TOTAL / TRAINABLE parameters
+###############################################
+
+import os, json, random, csv
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, transforms, models
+from torchvision.models import ShuffleNet_V2_X0_5_Weights
+from sklearn.metrics import (
+    confusion_matrix as sk_confusion_matrix,
+    precision_recall_fscore_support,
+    accuracy_score,
+    average_precision_score,
+    classification_report
+)
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# =============================
+# 1) Config
+# =============================
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# User paths (from conversation)
+DATA_ROOT = "/content/drive/MyDrive/Hybrid Data/CK+"  # folders: contempt, fear, anger, happy, disgust, sadness, surprise
+SAVE_DIR  = "/content/drive/MyDrive/Hybrid Data/Results-MobileNetv3 -Small-VIT-CK+ Training"  # reuse path
+Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
+
+# Training hyperparams
+IMG_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 60                 # adjust as needed
+BASE_LR = 3e-4
+WEIGHT_DECAY = 1e-4
+VAL_SPLIT = 0.15
+TEST_SPLIT = 0.15
+NUM_WORKERS = 2
+PATIENCE = 10               # early stopping patience
+LABEL_SMOOTH = 0.05
+
+with open(os.path.join(SAVE_DIR, 'run_meta.json'), 'w') as f:
+    json.dump({
+        'timestamp': datetime.now().isoformat(),
+        'dataset_root': DATA_ROOT,
+        'save_dir': SAVE_DIR,
+        'img_size': IMG_SIZE,
+        'batch_size': BATCH_SIZE,
+        'epochs': EPOCHS,
+        'lr': BASE_LR,
+        'weight_decay': WEIGHT_DECAY,
+        'val_split': VAL_SPLIT,
+        'test_split': TEST_SPLIT,
+        'seed': SEED,
+        'device': str(device),
+        'model': 'ShuffleNetV2_0.5 (pretrained) + TinyAttentionHead',
+        'note': '<2M parameter design with pretrained backbone'
+    }, f, indent=2)
+
+# =============================
+# 2) Data
+# =============================
+train_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.RandomApply([transforms.ColorJitter(0.2,0.2,0.2,0.08)], p=0.5),
+    transforms.RandomRotation(12),
+    transforms.RandomAffine(degrees=0, translate=(0.06,0.06), scale=(0.9,1.1)),
+    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+eval_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+])
+
+full_eval = datasets.ImageFolder(DATA_ROOT, transform=eval_tfms)
+CLASS_NAMES = full_eval.classes
+NUM_CLASSES = len(CLASS_NAMES)
+
+# stratified split 70/15/15 (deterministic)
+indices_by_class = {c: [] for c in range(NUM_CLASSES)}
+for idx, (_, y) in enumerate(full_eval.samples):
+    indices_by_class[y].append(idx)
+
+train_idx, val_idx, test_idx = [], [], []
+for c, idxs in indices_by_class.items():
+    n = len(idxs)
+    n_val  = int(n * VAL_SPLIT)
+    n_test = int(n * TEST_SPLIT)
+    n_train = n - n_val - n_test
+    rnd = random.Random(SEED + c)
+    rnd.shuffle(idxs)
+    train_idx += idxs[:n_train]
+    val_idx   += idxs[n_train:n_train+n_val]
+    test_idx  += idxs[n_train+n_val:]
+
+train_ds = torch.utils.data.Subset(datasets.ImageFolder(DATA_ROOT, transform=train_tfms), train_idx)
+val_ds   = torch.utils.data.Subset(datasets.ImageFolder(DATA_ROOT, transform=eval_tfms),  val_idx)
+test_ds  = torch.utils.data.Subset(datasets.ImageFolder(DATA_ROOT, transform=eval_tfms),  test_idx)
+
+# class-balanced sampler for train
+train_targets = [full_eval.samples[i][1] for i in train_idx]
+class_counts = np.bincount(train_targets, minlength=NUM_CLASSES)
+class_weights = 1.0 / (class_counts + 1e-6)
+weights = [class_weights[t] for t in train_targets]
+train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=NUM_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,   num_workers=NUM_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False,   num_workers=NUM_WORKERS, pin_memory=True)
+
+# =============================
+# 3) Model (<2M): ShuffleNetV2 0.5 (pretrained) + Tiny Attention Head
+# =============================
+class TinyAttentionHead(nn.Module):
+    """Tiny ViT-style attention over CNN tokens (kept very small)."""
+    def __init__(self, in_ch, d_model=128, num_heads=2, mlp_ratio=2.0, dropout=0.0):
+        super().__init__()
+        self.proj = nn.Conv2d(in_ch, d_model, kernel_size=1, bias=False)
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True)
+        hidden = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden), nn.GELU(),
+            nn.Linear(hidden, d_model)
+        )
+        nn.init.normal_(self.cls, std=0.02)
+
+    def forward(self, feat):
+        # feat: (B, C, H, W)
+        x = self.proj(feat)                  # (B, d, H, W)
+        B, d, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)     # (B, HW, d)
+        cls = self.cls.expand(B, -1, -1)     # (B, 1, d)
+        tokens = torch.cat([cls, x], dim=1)  # (B, 1+HW, d)
+        tokens = self.ln1(tokens)
+        q = tokens[:, :1, :]
+        k = v = tokens
+        attn_out, _ = self.attn(q, k, v)     # (B, 1, d)
+        z = attn_out + self.mlp(attn_out)
+        return z.squeeze(1)                  # (B, d)
+
+class ShuffleNetTinyAttention(nn.Module):
+    def __init__(self, num_classes=7, att_dim=128, att_heads=2):
+        super().__init__()
+        backbone = models.shufflenet_v2_x0_5(weights=ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1)
+        # Remove classifier, keep features
+        self.features = nn.Sequential(*(list(backbone.children())[:-1]))  # up to conv5
+        # Determine last channel count by running a dummy once (build-time, no grad)
+        with torch.no_grad():
+            dummy = torch.zeros(1,3,224,224)
+            feat = self.features(dummy)
+            c_last = feat.shape[1]
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.att = TinyAttentionHead(in_ch=c_last, d_model=att_dim, num_heads=att_heads)
+        fused_dim = att_dim + c_last
+        self.head = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Dropout(0.1),
+            nn.Linear(fused_dim, num_classes)
+        )
+
+    def forward(self, x):
+        feat = self.features(x)              # (B,C,H,W)
+        att_vec = self.att(feat)             # (B,att_dim)
+        gap_vec = self.pool(feat).flatten(1) # (B,C)
+        fused = torch.cat([att_vec, gap_vec], dim=1)
+        logits = self.head(fused)
+        return logits
+
+model = ShuffleNetTinyAttention(num_classes=NUM_CLASSES, att_dim=128, att_heads=2).to(device)
+
+# Parameter count (show & save)
+TOTAL_PARAMS = sum(p.numel() for p in model.parameters())
+TRAINABLE_PARAMS = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total parameters: {TOTAL_PARAMS:,} (~{TOTAL_PARAMS/1e6:.2f}M)")
+print(f"Trainable parameters: {TRAINABLE_PARAMS:,} (~{TRAINABLE_PARAMS/1e6:.2f}M)")
+with open(os.path.join(SAVE_DIR, 'model_parameters.txt'), 'w') as f:
+    f.write(f"Total parameters: {TOTAL_PARAMS}")
+    f.write(f"Trainable parameters: {TRAINABLE_PARAMS}")
+
+assert TOTAL_PARAMS < 2_000_000, "Model exceeds 2M parameters — reduce att_dim to 96 or 64."
+
+# =============================
+# 4) Loss, Optimizer, Scheduler
+# =============================
+class LabelSmoothingCE(nn.Module):
+    def __init__(self, eps=LABEL_SMOOTH):
+        super().__init__()
+        self.eps = eps
+        self.log_softmax = nn.LogSoftmax(dim=1)
+    def forward(self, logits, target):
+        n = logits.size(1)
+        log_preds = self.log_softmax(logits)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_preds)
+            true_dist.fill_(self.eps / (n - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1 - self.eps)
+        return torch.mean(torch.sum(-true_dist * log_preds, dim=1))
+
+criterion = LabelSmoothingCE()
+optimizer = torch.optim.AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+# =============================
+# 5) Epoch Runner & Metrics
+# =============================
+
+def _eval_predictions(logits_cpu, labels_cpu):
+    probs = torch.softmax(logits_cpu, dim=1).numpy()
+    y_true = labels_cpu.numpy()
+    y_pred = np.argmax(probs, axis=1)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='macro', zero_division=0)
+
+    # mAP (macro) one-vs-rest
+    y_true_ovr = np.eye(NUM_CLASSES)[y_true]
+    ap_per_class = []
+    for c in range(NUM_CLASSES):
+        try:
+            ap = average_precision_score(y_true_ovr[:, c], probs[:, c])
+        except Exception:
+            ap = 0.0
+        ap_per_class.append(ap)
+    mAP = float(np.mean(ap_per_class))
+
+    return acc, prec, rec, f1, mAP, y_true, y_pred
+
+
+def run_epoch(loader, train_mode=True):
+    model.train() if train_mode else model.eval()
+    running_loss = 0.0
+    all_logits, all_labels = [], []
+
+    for imgs, labels in loader:
+        imgs, labels = imgs.to(device), labels.to(device)
+        if train_mode:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(train_mode):
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+            if train_mode:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+        running_loss += loss.item() * imgs.size(0)
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+
+    epoch_loss = running_loss / len(loader.dataset)
+    logits_cpu = torch.cat(all_logits)
+    labels_cpu = torch.cat(all_labels)
+    acc, pr, rc, f1, mAP, y_true, y_pred = _eval_predictions(logits_cpu, labels_cpu)
+    return epoch_loss, acc, pr, rc, f1, mAP, y_true, y_pred
+
+# =============================
+# 6) Train Loop (with Early Stopping)
+# =============================
+
+history = {k: [] for k in ['epoch','train_loss','val_loss','val_acc','val_precision','val_recall','val_f1','val_mAP']}
+
+best_val_acc = -1.0
+no_improve = 0
+best_state = None
+
+print("=== Training <2M model (pretrained backbone) ===")
+for ep in range(1, EPOCHS+1):
+    tr_loss, *_ = run_epoch(train_loader, train_mode=True)
+    va_loss, va_acc, va_pr, va_rc, va_f1, va_mAP, *_ = run_epoch(val_loader, train_mode=False)
+
+    scheduler.step()
+
+    history['epoch'].append(ep)
+    history['train_loss'].append(tr_loss)
+    history['val_loss'].append(va_loss)
+    history['val_acc'].append(va_acc)
+    history['val_precision'].append(va_pr)
+    history['val_recall'].append(va_rc)
+    history['val_f1'].append(va_f1)
+    history['val_mAP'].append(va_mAP)
+
+    print(f"[Ep{ep:02d}] train_loss={tr_loss:.4f} | val_loss={va_loss:.4f} | val_acc={va_acc*100:.2f}% | P={va_pr:.3f} R={va_rc:.3f} F1={va_f1:.3f} mAP={va_mAP:.3f}")
+
+    if va_acc > best_val_acc:
+        best_val_acc = va_acc
+        best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+        torch.save(best_state, os.path.join(SAVE_DIR, 'best.pth'))
+        no_improve = 0
+    else:
+        no_improve += 1
+
+    if no_improve >= PATIENCE:
+        print(f"Early stopping at epoch {ep} (no improvement for {PATIENCE} epochs)")
+        break
+
+# Save history CSV/JSON
+hist_df = pd.DataFrame(history)
+hist_csv = os.path.join(SAVE_DIR, 'training_history.csv')
+hist_df.to_csv(hist_csv, index=False)
+with open(os.path.join(SAVE_DIR, 'history.json'), 'w') as f:
+    json.dump(history, f, indent=2)
+
+# =============================
+# 7) Test Evaluation (load best)
+# =============================
+if best_state is None and os.path.exists(os.path.join(SAVE_DIR, 'best.pth')):
+    best_state = torch.load(os.path.join(SAVE_DIR, 'best.pth'), map_location='cpu')
+if best_state is not None:
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()}, strict=False)
+
+te_loss, te_acc, te_pr, te_rc, te_f1, te_mAP, y_true, y_pred = run_epoch(test_loader, train_mode=False)
+print("=== TEST (Best) ===")
+print(f"Loss {te_loss:.4f} | Acc {te_acc:.4f} | Precision {te_pr:.4f} | Recall {te_rc:.4f} | F1 {te_f1:.4f} | mAP {te_mAP:.4f}")
+
+summary = {
+    'total_params': int(TOTAL_PARAMS),
+    'trainable_params': int(TRAINABLE_PARAMS),
+    'test_loss': float(te_loss),
+    'test_accuracy': float(te_acc),
+    'test_precision_macro': float(te_pr),
+    'test_recall_macro': float(te_rc),
+    'test_f1_macro': float(te_f1),
+    'test_mAP_macro': float(te_mAP),
+    'classes': CLASS_NAMES,
+    'pretrained_backbone': 'ShuffleNetV2_x0_5 (ImageNet1K)'
+}
+with open(os.path.join(SAVE_DIR, 'summary.json'), 'w') as f:
+    json.dump(summary, f, indent=2)
+
+# =============================
+# 8) Plots (Loss & Metrics)
+# =============================
+plt.figure()
+plt.plot(history['epoch'], history['train_loss'], label='Train Loss')
+plt.plot(history['epoch'], history['val_loss'], label='Val Loss')
+plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.title('Training vs Validation Loss')
+plt.legend(); plt.grid(True, linestyle=':')
+loss_plot = os.path.join(SAVE_DIR, 'loss_train_val.png')
+plt.savefig(loss_plot, bbox_inches='tight', dpi=150)
+plt.show(); plt.close()
+
+plt.figure()
+plt.plot(history['epoch'], [a*100 for a in history['val_acc']], label='Acc (%)')
+plt.plot(history['epoch'], [p*100 for p in history['val_precision']], label='Precision (%)')
+plt.plot(history['epoch'], [r*100 for r in history['val_recall']], label='Recall (%)')
+plt.plot(history['epoch'], [f*100 for f in history['val_f1']], label='F1 (%)')
+plt.plot(history['epoch'], [m*100 for m in history['val_mAP']], label='mAP (%)')
+plt.xlabel('Epoch'); plt.ylabel('Metric (%)'); plt.title('Validation Metrics Over Epochs')
+plt.legend(); plt.grid(True, linestyle=':')
+metrics_plot = os.path.join(SAVE_DIR, 'metrics_val.png')
+plt.savefig(metrics_plot, bbox_inches='tight', dpi=150)
+plt.show(); plt.close()
+
+# =============================
+# 9) Confusion Matrix (Test)
+# =============================
+cm = sk_confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
+plt.figure(figsize=(7,6))
+im = plt.imshow(cm, interpolation='nearest')
+plt.title('Confusion Matrix (Test)')
+plt.colorbar(im)
+ticks = np.arange(NUM_CLASSES)
+plt.xticks(ticks, CLASS_NAMES, rotation=45, ha='right')
+plt.yticks(ticks, CLASS_NAMES)
+plt.xlabel('Predicted'); plt.ylabel('True')
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        plt.text(j, i, cm[i, j], ha='center', va='center', fontsize=8)
+cm_path = os.path.join(SAVE_DIR, 'confusion_matrix_test.png')
+plt.tight_layout(); plt.savefig(cm_path, bbox_inches='tight', dpi=150)
+plt.show(); plt.close()
+
+with open(os.path.join(SAVE_DIR, 'classification_report_test.txt'), 'w') as f:
+    f.write(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=4))
+
+# =============================
+# 10) History (readable CSV)
+# =============================
+with open(os.path.join(SAVE_DIR, 'history_readable.csv'), 'w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['epoch','train_loss','val_loss','val_acc','val_precision','val_recall','val_f1','val_mAP'])
+    for i in range(len(history['epoch'])):
+        w.writerow([
+            history['epoch'][i],
+            f"{history['train_loss'][i]:.6f}",
+            f"{history['val_loss'][i]:.6f}",
+            f"{history['val_acc'][i]:.6f}",
+            f"{history['val_precision'][i]:.6f}",
+            f"{history['val_recall'][i]:.6f}",
+            f"{history['val_f1'][i]:.6f}",
+            f"{history['val_mAP'][i]:.6f}",
+        ])
+
+print('Saved outputs to:')
+print(' -', hist_csv)
+print(' -', loss_plot)
+print(' -', metrics_plot)
+print(' -', cm_path)
+print(' -', os.path.join(SAVE_DIR, 'summary.json'))
+print(' -', os.path.join(SAVE_DIR, 'model_parameters.txt'))
+print(' - best weights: ', os.path.join(SAVE_DIR, 'best.pth'))
