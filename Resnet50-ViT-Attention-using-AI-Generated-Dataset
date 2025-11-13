@@ -1,0 +1,641 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+# ===========================
+# ResNet50 + ViT (Attention) — Emotion Classification from YOLO boxes
+# ===========================
+!pip -q install --upgrade torch torchvision scikit-learn matplotlib
+
+
+# ============================================================
+# ResNet50 + ViT (Attention Fusion) — Emotion Classification
+# • Loads YOLO-format labels and crops faces for emotion classification
+# • Two backbones (ResNet50 + ViT) → 512-d each → attention fusion → classifier
+# • Tracks accuracy/precision/recall/F1/mAP, TP/FP/FN/TN, IoU, AR
+# • Saves best/last checkpoints, logs, and plots
+# ============================================================
+
+# ---------------------------
+# Imports
+# ---------------------------
+import os, sys, json, math, random, shutil, gc, csv             # std libs: paths, IO, randomness, etc.
+from pathlib import Path                                        # path utilities
+from typing import List, Tuple                                   # typing hints
+import numpy as np                                               # arrays / numerics
+from PIL import Image                                            # image loading / cropping
+
+import torch                                                     # core PyTorch
+import torch.nn as nn                                            # neural network modules
+import torch.nn.functional as F                                  # functional ops (softmax, relu, etc.)
+from torch.utils.data import Dataset, DataLoader, random_split   # dataset / loader helpers
+
+import torchvision                                               # vision models and transforms
+from torchvision import transforms                               # data augmentation / preprocessing
+from torchvision.models import resnet50, vit_b_16                # backbones
+from torchvision.models import ResNet50_Weights, ViT_B_16_Weights# pretrained weights handles
+
+from sklearn.metrics import (                                     # sklearn metrics for evaluation
+    confusion_matrix, accuracy_score, precision_score,
+    recall_score, f1_score, average_precision_score
+)
+
+import matplotlib.pyplot as plt                                  # plotting metrics
+
+# ---------------------------
+# Config — paths, classes, hyperparams
+# ---------------------------
+DATA_ROOT = "/content/drive/MyDrive/Hybrid Data/dataset-pose-emotion-new"  # expects images/ and labels/
+RESULTS_DIR = "/content/drive/MyDrive/Hybrid Data/Results-Emotion-dataset1836-Resnet50+VIT attention weights"
+
+# Emotion classes (IDs 0–7). Pose IDs (8–11) are ignored for this task.
+CLASSES = {
+    0: "happy", 1: "angry", 2: "sad", 3: "satisfied",
+    4: "dissatisfied", 5: "fear", 6: "concentrated", 7: "neutral"
+}
+NUM_CLASSES = 8
+EMOTION_IDS = set(range(0, 8))   # keep these labels
+POSE_IDS    = set(range(8, 12))  # ignore these
+
+# Core training settings
+IMG_SIZE = 224
+BATCH_SIZE = 32
+NUM_WORKERS = 2
+EPOCHS = 50
+VAL_SPLIT = 0.15
+TEST_SPLIT = 0.10
+SEED = 1836
+LR = 1e-4
+WEIGHT_DECAY = 1e-4
+PATIENCE = 7  # early stop if val loss stops improving
+
+# Create results folder and select device (GPU if available)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", DEVICE)
+
+# ---------------------------
+# Reproducibility — fix random seeds and cudnn flags
+# ---------------------------
+def set_seed(seed=42):
+    random.seed(seed)                        # Python RNG
+    np.random.seed(seed)                     # NumPy RNG
+    torch.manual_seed(seed)                  # PyTorch CPU RNG
+    torch.cuda.manual_seed_all(seed)         # PyTorch GPU RNGs
+    torch.backends.cudnn.deterministic = True  # deterministic convs
+    torch.backends.cudnn.benchmark = False     # no auto-tune for speed (more deterministic)
+set_seed(SEED)
+
+# ---------------------------
+# Dataset index builder (from YOLO labels) — emotions only
+# ---------------------------
+IMG_DIR = Path(DATA_ROOT) / "images"         # where images live
+LBL_DIR = Path(DATA_ROOT) / "labels"         # where YOLO txt labels live
+
+assert IMG_DIR.exists(), f"Missing {IMG_DIR}"
+assert LBL_DIR.exists(), f"Missing {LBL_DIR}"
+
+def read_yolo_file(label_path: Path):
+    """
+    Reads a YOLO label file and returns a list of (cls, cx, cy, w, h),
+    where coordinates are normalized in [0,1].
+    """
+    items = []
+    if not label_path.exists():
+        return items
+    with open(label_path, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 5:              # guard malformed lines
+                continue
+            cls = int(float(parts[0]))       # class id
+            cx, cy, w, h = map(float, parts[1:])  # normalized bbox
+            items.append((cls, cx, cy, w, h))
+    return items
+
+def yolo_to_xyxy(cx, cy, w, h, W, H):
+    """
+    Converts normalized YOLO box (cx,cy,w,h) → absolute pixel coords (x1,y1,x2,y2),
+    clamped to image boundaries.
+    """
+    x1 = (cx - w/2.0) * W
+    y1 = (cy - h/2.0) * H
+    x2 = (cx + w/2.0) * W
+    y2 = (cy + h/2.0) * H
+    # clamp within image
+    x1 = max(0, min(W-1, x1))
+    y1 = max(0, min(H-1, y1))
+    x2 = max(0, min(W-1, x2))
+    y2 = max(0, min(H-1, y2))
+    return int(x1), int(y1), int(x2), int(y2)
+
+# Cache file to avoid re-scanning on every run
+INDEX_CSV = Path(RESULTS_DIR) / "index_emotions_only.csv"
+
+if INDEX_CSV.exists():
+    # If cache exists: load rows as (img_path, cls, x1,y1,x2,y2)
+    print("Loading cached index:", INDEX_CSV)
+    index = []
+    with open(INDEX_CSV, newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            index.append((r["img_path"], int(r["cls"]), int(r["x1"]), int(r["y1"]), int(r["x2"]), int(r["y2"])))
+else:
+    # Build index by scanning images and their label txt files
+    print("Scanning dataset to create index (emotions only)...")
+    index = []
+    exts = {".jpg",".jpeg",".png",".bmp",".webp"}  # valid image extensions
+    for img_path in IMG_DIR.rglob("*"):
+        if img_path.suffix.lower() not in exts:
+            continue
+        stem = img_path.stem
+        lbl_path = LBL_DIR / f"{stem}.txt"
+        items = read_yolo_file(lbl_path)          # parse YOLO bboxes for this image
+        if not items:
+            continue
+        # open once to get image size (W,H)
+        try:
+            with Image.open(img_path) as im:
+                W, H = im.size
+        except Exception:
+            continue
+        # keep only emotion-class boxes (0–7), convert to pixel xyxy and append
+        for (cls, cx, cy, w, h) in items:
+            if cls in EMOTION_IDS:
+                x1,y1,x2,y2 = yolo_to_xyxy(cx, cy, w, h, W, H)
+                if x2>x1 and y2>y1:               # valid box
+                    index.append((str(img_path), int(cls), x1,y1,x2,y2))
+    # Save index to CSV for next time
+    with open(INDEX_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["img_path","cls","x1","y1","x2","y2"])
+        writer.writeheader()
+        for row in index:
+            writer.writerow({"img_path":row[0],"cls":row[1],"x1":row[2],"y1":row[3],"x2":row[4],"y2":row[5]})
+
+print(f"Total emotion crops indexed: {len(index)}")
+assert len(index) > 0, "No emotion boxes found (classes 0-7). Check your labels."
+
+# ---------------------------
+# Torch Datasets & Transforms
+# ---------------------------
+# Training transforms: minor augmentation + normalization to ImageNet stats
+train_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.05),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+])
+
+# Validation/Test transforms: deterministic resize + normalization
+val_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+])
+
+class CropsDataset(Dataset):
+    """
+    Simple dataset:
+    - Loads the image
+    - Crops to the face bbox (emotion region)
+    - Applies transforms
+    - Returns (tensor_image, class_id)
+    """
+    def __init__(self, index_list, transform):
+        self.items = index_list
+        self.t = transform
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        img_path, cls, x1,y1,x2,y2 = self.items[i]
+        with Image.open(img_path).convert("RGB") as im:
+            crop = im.crop((x1,y1,x2,y2))
+        return self.t(crop), cls
+
+# ---------------------------
+# Split into train/val/test (by crops, not by images)
+# ---------------------------
+set_seed(SEED)                                # ensure split reproducibility
+N = len(index)
+n_test = int(TEST_SPLIT * N)
+n_val  = int(VAL_SPLIT * N)
+n_train = N - n_val - n_test
+perm = np.random.permutation(N)               # random permutation of indices
+train_index = [index[i] for i in perm[:n_train]]
+val_index   = [index[i] for i in perm[n_train:n_train+n_val]]
+test_index  = [index[i] for i in perm[n_train+n_val:]]
+
+# Instantiate datasets/loaders
+train_ds = CropsDataset(train_index, train_tfms)
+val_ds   = CropsDataset(val_index, val_tfms)
+test_ds  = CropsDataset(test_index, val_tfms)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"Splits -> train: {len(train_ds)}, val: {len(val_ds)}, test: {len(test_ds)}")
+
+# ---------------------------
+# Model definitions
+#   ResNet50Backbone: 2048-d GAP → Linear to 512-d
+#   ViTBackbone: CLS 768-d → Linear to 512-d
+#   AttnFuse: per-stream attention over [ResNet, ViT] → fused 512-d
+#   ResNetViT_Attn: combines all and outputs logits (num_classes)
+# ---------------------------
+class ResNet50Backbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        m = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)   # load ImageNet-pretrained weights
+        self.backbone = nn.Sequential(*list(m.children())[:-1])# keep up to GAP; output: (B, 2048, 1, 1)
+        self.head = nn.Linear(2048, 512)                       # project to 512-d
+
+    def forward(self, x):
+        f = self.backbone(x)    # (B, 2048, 1, 1)
+        f = torch.flatten(f, 1) # (B, 2048)
+        f = self.head(f)        # (B, 512)
+        return f
+
+class ViTBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1) # ViT-B/16 pretrained
+        vit.heads = nn.Identity()                              # remove classifier to get CLS embedding (768-d)
+        self.vit = vit
+        self.proj = nn.Linear(768, 512)                        # project to 512-d to match ResNet stream
+
+    def forward(self, x):
+        f = self.vit(x)   # (B, 768) — CLS token embedding
+        f = self.proj(f)  # (B, 512)
+        return f
+
+class AttnFuse(nn.Module):
+    """
+    Simple stream-attention:
+    - Stack features per stream: (B, S, D) where S=2 streams [ResNet, ViT]
+    - Score each stream with a tiny MLP (Linear→Tanh→Linear)
+    - Softmax over streams to get weights
+    - Weighted sum to fuse into a single (B, D) vector
+    """
+    def __init__(self, dim=512, num_streams=2):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(dim, dim//2),
+            nn.Tanh(),
+            nn.Linear(dim//2, 1)
+        )
+        self.num_streams = num_streams
+
+    def forward(self, feats: List[torch.Tensor]):  # feats: list of [B, D]
+        stacked = torch.stack(feats, dim=1)        # (B, S, D)
+        scores = self.attn(stacked).squeeze(-1)    # (B, S) — unnormalized attention scores
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B, S, 1)
+        fused = (stacked * weights).sum(dim=1)     # (B, D) — weighted sum across streams
+        return fused, weights.squeeze(-1)          # return fused vector + per-stream weights
+
+class ResNetViT_Attn(nn.Module):
+    def __init__(self, num_classes=8):
+        super().__init__()
+        self.rn = ResNet50Backbone()               # stream 1
+        self.vt = ViTBackbone()                    # stream 2
+        self.fuse = AttnFuse(dim=512, num_streams=2)
+        self.classifier = nn.Linear(512, num_classes)
+
+    def forward(self, x):
+        r = self.rn(x)                             # (B,512) ResNet features
+        v = self.vt(x)                             # (B,512) ViT-CLS features
+        fused, weights = self.fuse([r, v])         # (B,512), (B,2)
+        logits = self.classifier(fused)            # (B,num_classes)
+        return logits, weights                     # return attention weights for analysis
+
+# Instantiate model and move to device
+model = ResNetViT_Attn(num_classes=NUM_CLASSES).to(DEVICE)
+
+# ---------------------------
+# Optimizer / Scheduler / Loss
+# ---------------------------
+criterion = nn.CrossEntropyLoss()                                  # multiclass classification loss
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+# ---------------------------
+# Metrics helper — classification + AP/mAP + confusion-derived stats
+# ---------------------------
+def epoch_metrics(y_true, y_pred, y_prob, num_classes):
+    """
+    Aggregates standard metrics:
+    - Accuracy, Precision/Recall/F1 (micro/macro/weighted)
+    - AP per class + mAP (one-vs-rest)
+    - From confusion matrix: TP/FP/FN/TN, IoU per class, and Average Recall (mean recall)
+    """
+    metrics = {}
+
+    # Basic metrics
+    metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+    for avg in ["micro", "macro", "weighted"]:
+        metrics[f"precision_{avg}"] = float(precision_score(y_true, y_pred, average=avg, zero_division=0))
+        metrics[f"recall_{avg}"]    = float(recall_score(y_true, y_pred, average=avg, zero_division=0))
+        metrics[f"f1_{avg}"]        = float(f1_score(y_true, y_pred, average=avg, zero_division=0))
+
+    # One-vs-rest AP per class (requires probability scores)
+    Y_true_ovr = np.zeros((len(y_true), num_classes), dtype=np.int32)
+    for i, c in enumerate(y_true):
+        Y_true_ovr[i, c] = 1
+    try:
+        ap_per_class = []
+        for c in range(num_classes):
+            ap = average_precision_score(Y_true_ovr[:, c], y_prob[:, c])
+            ap_per_class.append(0.0 if np.isnan(ap) else ap)
+        metrics["mAP"] = float(np.mean(ap_per_class))
+        metrics["AP_per_class"] = ap_per_class
+    except Exception:
+        metrics["mAP"] = 0.0
+        metrics["AP_per_class"] = [0.0]*num_classes
+
+    # Confusion-matrix derived stats
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    TP = np.diag(cm)
+    FP = cm.sum(axis=0) - TP
+    FN = cm.sum(axis=1) - TP
+    TN = cm.sum() - (TP + FP + FN)
+    eps = 1e-12
+    prec_c = TP / (TP + FP + eps)
+    rec_c  = TP / (TP + FN + eps)
+    iou_c  = TP / (TP + FP + FN + eps)
+
+    metrics["TP"] = TP.tolist()
+    metrics["FP"] = FP.tolist()
+    metrics["FN"] = FN.tolist()
+    metrics["TN"] = TN.tolist()
+    metrics["IoU_per_class"] = iou_c.tolist()
+    metrics["AR"] = float(np.mean(rec_c))  # Average Recall across classes
+
+    return metrics
+
+# ---------------------------
+# One-epoch runner (train or eval)
+# ---------------------------
+def run_one_epoch(loader, train=True):
+    model.train() if train else model.eval()
+    epoch_loss = 0.0
+    y_true_all, y_pred_all = [], []
+    y_prob_all = []
+
+    # Enable grad only during training
+    with torch.set_grad_enabled(train):
+        for imgs, labels in loader:
+            imgs = imgs.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+
+            logits, _ = model(imgs)                          # forward pass
+            loss = criterion(logits, labels)                 # compute CE loss
+
+            if train:
+                optimizer.zero_grad(set_to_none=True)        # clear grads
+                loss.backward()                              # backprop
+                optimizer.step()                             # update weights
+
+            epoch_loss += loss.item() * imgs.size(0)         # accumulate total loss
+
+            probs = F.softmax(logits.detach(), dim=1)        # detach for metrics
+            y_prob_all.append(probs.cpu().numpy())
+            y_true_all.append(labels.cpu().numpy())
+            y_pred_all.append(probs.argmax(dim=1).cpu().numpy())
+
+    # Aggregate epoch metrics
+    N = len(loader.dataset)
+    avg_loss = epoch_loss / max(1, N)
+    y_true = np.concatenate(y_true_all)
+    y_pred = np.concatenate(y_pred_all)
+    y_prob = np.concatenate(y_prob_all)
+
+    mets = epoch_metrics(y_true, y_pred, y_prob, NUM_CLASSES)
+    return avg_loss, mets
+
+# ---------------------------
+# Training loop with early stopping (by val loss)
+# ---------------------------
+history = {
+    "epoch": [],
+    "train_loss": [], "val_loss": [],
+    "acc": [], "prec_macro": [], "rec_macro": [], "f1_macro": [], "mAP": []
+}
+
+best_val_loss = float("inf")
+best_path = os.path.join(RESULTS_DIR, "best_resnet50_vit_attn.pth")
+last_path = os.path.join(RESULTS_DIR, "last_resnet50_vit_attn.pth")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+early_stop_counter = 0
+
+for epoch in range(1, EPOCHS+1):
+    train_loss, train_mets = run_one_epoch(train_loader, train=True)    # train pass
+    val_loss,   val_mets   = run_one_epoch(val_loader,   train=False)   # val pass
+    scheduler.step()                                                    # LR schedule step
+
+    # Log epoch stats
+    history["epoch"].append(epoch)
+    history["train_loss"].append(train_loss)
+    history["val_loss"].append(val_loss)
+    history["acc"].append(val_mets["accuracy"])
+    history["prec_macro"].append(val_mets["precision_macro"])
+    history["rec_macro"].append(val_mets["recall_macro"])
+    history["f1_macro"].append(val_mets["f1_macro"])
+    history["mAP"].append(val_mets["mAP"])
+
+    # Save "last" checkpoint every epoch (for resume)
+    torch.save({
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "history": history
+    }, last_path)
+
+    # Save "best" checkpoint if val loss improved
+    if val_loss < best_val_loss - 1e-6:
+        best_val_loss = val_loss
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "history": history
+        }, best_path)
+        early_stop_counter = 0
+        best_flag = " (best)"
+    else:
+        early_stop_counter += 1
+        best_flag = ""
+
+    # Console summary line for the epoch
+    print(f"[Epoch {epoch:03d}] "
+          f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f}{best_flag} | "
+          f"acc={val_mets['accuracy']:.4f} | "
+          f"prec={val_mets['precision_macro']:.4f} | "
+          f"rec={val_mets['recall_macro']:.4f} | "
+          f"f1={val_mets['f1_macro']:.4f} | mAP={val_mets['mAP']:.4f}")
+
+    # Early stopping if no val-loss improvement for PATIENCE epochs
+    if early_stop_counter >= PATIENCE:
+        print(f"Early stopping triggered at epoch {epoch}.")
+        break
+
+# ---------------------------
+# Save history CSV
+# ---------------------------
+log_csv = os.path.join(RESULTS_DIR, "training_log.csv")
+with open(log_csv, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch","train_loss","val_loss","acc","prec_macro","rec_macro","f1_macro","mAP"])
+    for i in range(len(history["epoch"])):
+        writer.writerow([
+            history["epoch"][i],
+            history["train_loss"][i],
+            history["val_loss"][i],
+            history["acc"][i],
+            history["prec_macro"][i],
+            history["rec_macro"][i],
+            history["f1_macro"][i],
+            history["mAP"][i]
+        ])
+print("Saved log:", log_csv)
+
+# ---------------------------
+# Final TEST evaluation (held-out split) with detailed exports
+# ---------------------------
+def collect_preds(loader):
+    """
+    Runs model in eval mode and returns concatenated:
+    - y_true (N,), y_pred (N,), y_prob (N,C)
+    """
+    model.eval()
+    y_true_all, y_pred_all, y_prob_all = [], [], []
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs = imgs.to(DEVICE)
+            labels = labels.to(DEVICE)
+            logits, _ = model(imgs)
+            probs = F.softmax(logits, dim=1)
+            y_prob_all.append(probs.cpu().numpy())
+            y_true_all.append(labels.cpu().numpy())
+            y_pred_all.append(probs.argmax(dim=1).cpu().numpy())
+    y_true = np.concatenate(y_true_all)
+    y_pred = np.concatenate(y_pred_all)
+    y_prob = np.concatenate(y_prob_all)
+    return y_true, y_pred, y_prob
+
+# Compute test metrics
+y_true_t, y_pred_t, y_prob_t = collect_preds(test_loader)
+test_mets = epoch_metrics(y_true_t, y_pred_t, y_prob_t, NUM_CLASSES)
+
+# Save per-class metrics CSV (includes TP/FP/FN/TN, precision, recall, IoU, AP)
+per_class_csv = os.path.join(RESULTS_DIR, "test_per_class_metrics.csv")
+with open(per_class_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["class_id","class_name","TP","FP","FN","TN","precision","recall","IoU","AP"])
+    cm = confusion_matrix(y_true_t, y_pred_t, labels=list(range(NUM_CLASSES)))
+    TP = np.diag(cm)
+    FP = cm.sum(axis=0) - TP
+    FN = cm.sum(axis=1) - TP
+    TN = cm.sum() - (TP + FP + FN)
+    eps=1e-12
+    for c in range(NUM_CLASSES):
+        prec = TP[c]/(TP[c]+FP[c]+eps)
+        rec  = TP[c]/(TP[c]+FN[c]+eps)
+        iou  = TP[c]/(TP[c]+FP[c]+FN[c]+eps)
+        ap   = test_mets["AP_per_class"][c]
+        w.writerow([c, CLASSES[c], int(TP[c]), int(FP[c]), int(FN[c]), int(TN[c]), prec, rec, iou, ap])
+
+# Save overall test metrics as JSON
+with open(os.path.join(RESULTS_DIR, "test_overall_metrics.json"), "w") as f:
+    json.dump({
+        "accuracy": test_mets["accuracy"],
+        "precision_micro": test_mets["precision_micro"],
+        "recall_micro": test_mets["recall_micro"],
+        "f1_micro": test_mets["f1_micro"],
+        "precision_macro": test_mets["precision_macro"],
+        "recall_macro": test_mets["recall_macro"],
+        "f1_macro": test_mets["f1_macro"],
+        "precision_weighted": test_mets["precision_weighted"],
+        "recall_weighted": test_mets["recall_weighted"],
+        "f1_weighted": test_mets["f1_weighted"],
+        "mAP": test_mets["mAP"],
+        "AR": test_mets["AR"]
+    }, f, indent=2)
+
+# Console summary for test split
+print("\n=== TEST (overall) ===")
+for k in ["accuracy","precision_micro","recall_micro","f1_micro",
+          "precision_macro","recall_macro","f1_macro",
+          "precision_weighted","recall_weighted","f1_weighted","mAP","AR"]:
+    print(f"{k}: {test_mets[k]:.6f}")
+
+# ---------------------------
+# Plotting helpers & figures
+# ---------------------------
+def save_plot(x, y, title, ylabel, save_path):
+    """ Generic line plot wrapper with grid + tight layout """
+    plt.figure(figsize=(7.5,5))
+    plt.plot(x, y, marker="o")
+    plt.title(title)
+    plt.xlabel("Epoch")
+    plt.ylabel(ylabel)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+# 1) Train vs Val Loss curve
+plt.figure(figsize=(7.5,5))
+plt.plot(history["epoch"], history["train_loss"], marker="o", label="Train Loss")
+plt.plot(history["epoch"], history["val_loss"],   marker="o", label="Val Loss")
+plt.title("Training vs Validation Loss")
+plt.xlabel("Epoch"); plt.ylabel("Loss")
+plt.grid(True, linestyle="--", alpha=0.5); plt.legend()
+loss_plot_path = os.path.join(RESULTS_DIR, "plot_train_vs_val_loss.png")
+plt.tight_layout(); plt.savefig(loss_plot_path, dpi=220); plt.close()
+
+# 2) Validation curves: Accuracy / Precision(macro) / Recall(macro) / F1(macro) / mAP
+save_plot(history["epoch"], history["acc"],        "Validation Accuracy per Epoch", "Accuracy",
+          os.path.join(RESULTS_DIR, "plot_val_accuracy.png"))
+save_plot(history["epoch"], history["prec_macro"], "Validation Precision (macro) per Epoch", "Precision (macro)",
+          os.path.join(RESULTS_DIR, "plot_val_precision_macro.png"))
+save_plot(history["epoch"], history["rec_macro"],  "Validation Recall (macro) per Epoch", "Recall (macro)",
+          os.path.join(RESULTS_DIR, "plot_val_recall_macro.png"))
+save_plot(history["epoch"], history["f1_macro"],   "Validation F1 (macro) per Epoch", "F1 (macro)",
+          os.path.join(RESULTS_DIR, "plot_val_f1_macro.png"))
+save_plot(history["epoch"], history["mAP"],        "Validation mAP per Epoch", "mAP",
+          os.path.join(RESULTS_DIR, "plot_val_mAP.png"))
+
+# 3) Combined validation metrics in one figure (quick glance)
+plt.figure(figsize=(8,5))
+plt.plot(history["epoch"], history["acc"],        marker="o", label="Acc")
+plt.plot(history["epoch"], history["prec_macro"], marker="o", label="Prec(macro)")
+plt.plot(history["epoch"], history["rec_macro"],  marker="o", label="Rec(macro)")
+plt.plot(history["epoch"], history["f1_macro"],   marker="o", label="F1(macro)")
+plt.plot(history["epoch"], history["mAP"],        marker="o", label="mAP")
+plt.title("Validation Metrics per Epoch")
+plt.xlabel("Epoch"); plt.ylabel("Score")
+plt.grid(True, linestyle="--", alpha=0.5); plt.legend()
+combo_plot_path = os.path.join(RESULTS_DIR, "plot_val_metrics_combined.png")
+plt.tight_layout(); plt.savefig(combo_plot_path, dpi=220); plt.close()
+
+# Final artifact list for your reference
+print("\nSaved weights and results to:", RESULTS_DIR)
+print(" - best_resnet50_vit_attn.pth")
+print(" - last_resnet50_vit_attn.pth")
+print(" - training_log.csv")
+print(" - test_per_class_metrics.csv")
+print(" - test_overall_metrics.json")
+print(" - plot_train_vs_val_loss.png")
+print(" - plot_val_accuracy.png")
+print(" - plot_val_precision_macro.png")
+print(" - plot_val_recall_macro.png")
+print(" - plot_val_f1_macro.png")
+print(" - plot_val_mAP.png")
+print(" - plot_val_metrics_combined.png")
+
