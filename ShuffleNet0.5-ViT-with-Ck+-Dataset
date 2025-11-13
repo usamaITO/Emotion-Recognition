@@ -50,8 +50,8 @@ torch.backends.cudnn.deterministic = True
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # User paths (from conversation)
-DATA_ROOT = "/content/drive/MyDrive/Hybrid Data/CK+"  # folders: contempt, fear, anger, happy, disgust, sadness, surprise
-SAVE_DIR  = "/content/drive/MyDrive/Hybrid Data/Results-MobileNetv3 -Small-VIT-CK+ Training"  # reuse path
+DATA_ROOT = "/content/drive/MyDrive/Hybrid Data/CK+"  # folders: contempt, fear, anger, happy, disgust, sadness, surprise , here you just need to add your dataset path if needed.
+SAVE_DIR  = "/content/drive/MyDrive/Hybrid Data/Results-MobileNetv3 -Small-VIT-CK+ Training"  # reuse path . you can give your path where results will be stgored.
 Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
 
 # Training hyperparams
